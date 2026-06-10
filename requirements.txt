@@ -1,0 +1,7 @@
+polars>=0.20.0
+numba>=0.58.0
+numpy>=1.24.0
+plotly>=5.18.0
+dpkt>=1.9.8
+scapy>=2.5.0
+tqdm>=4.66.0
