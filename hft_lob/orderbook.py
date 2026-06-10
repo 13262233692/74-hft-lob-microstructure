@@ -1,6 +1,11 @@
 """
 L3 逐笔订单簿 (Level 3 Order Book) 高频重构引擎
 利用 Numba JIT 编译实现高性能状态机，在内存中还原全量限价订单簿
+
+核心特性：
+- LRU 滑动窗口淘汰：自动淘汰超过时间窗口未被触碰的订单，防止多日连续加载内存爆炸
+- 优雅静默容错：缺失订单引用时自动跳过并记录统计，绝不强杀整个推演进程
+- 十档深度实时计算：微秒级快照输出 Bid/Ask Top 10 价格与挂单量
 """
 
 from dataclasses import dataclass, field
@@ -29,23 +34,18 @@ MSG_REPLACE = np.uint8(4)
 
 DEPTH_LEVELS = 10
 
+DEFAULT_LRU_WINDOW_US = np.uint64(6 * 60 * 60 * 1_000_000)
+EVICTION_CHECK_INTERVAL = np.uint64(10_000)
+STATS_SIZE = 16
 
-@njit
-def _init_order_dict():
-    d = NumbaDict.empty(
-        key_type=uint64,
-        value_type=types.Tuple([uint32, uint64, uint8]),
-    )
-    return d
-
-
-@njit
-def _init_price_level_dict():
-    d = NumbaDict.empty(
-        key_type=uint64,
-        value_type=uint64,
-    )
-    return d
+STAT_N_MISSING_EXECUTE = 0
+STAT_N_MISSING_CANCEL = 1
+STAT_N_MISSING_DELETE = 2
+STAT_N_MISSING_REPLACE = 3
+STAT_N_LRU_EVICTED = 4
+STAT_N_ORDERS_PEAK = 5
+STAT_N_PRICE_LEVELS_PEAK = 6
+STAT_N_MSGS_PROCESSED = 7
 
 
 @njit
@@ -125,6 +125,131 @@ def _get_level_depth(
 
 
 @njit
+def _remove_order_from_price_level(
+    prc, shr, side,
+    buy_price_levels, buy_size_levels, buy_level_used, n_buy_levels, price_to_buy_idx,
+    sell_price_levels, sell_size_levels, sell_level_used, n_sell_levels, price_to_sell_idx,
+):
+    if side == BUY_SIDE:
+        if prc in price_to_buy_idx:
+            li = price_to_buy_idx[prc]
+            if buy_size_levels[li] >= shr:
+                buy_size_levels[li] -= shr
+            else:
+                buy_size_levels[li] = uint64(0)
+            if buy_size_levels[li] <= 0:
+                buy_size_levels[li] = uint64(0)
+                buy_level_used[li] = False
+                if prc in price_to_buy_idx:
+                    del price_to_buy_idx[prc]
+    else:
+        if prc in price_to_sell_idx:
+            li = price_to_sell_idx[prc]
+            if sell_size_levels[li] >= shr:
+                sell_size_levels[li] -= shr
+            else:
+                sell_size_levels[li] = uint64(0)
+            if sell_size_levels[li] <= 0:
+                sell_size_levels[li] = uint64(0)
+                sell_level_used[li] = False
+                if prc in price_to_sell_idx:
+                    del price_to_sell_idx[prc]
+
+    return n_buy_levels, n_sell_levels
+
+
+@njit
+def _add_order_to_price_level(
+    prc, shr, side,
+    buy_price_levels, buy_size_levels, buy_level_used, n_buy_levels, price_to_buy_idx,
+    sell_price_levels, sell_size_levels, sell_level_used, n_sell_levels, price_to_sell_idx,
+    MAX_LEVELS,
+):
+    if side == BUY_SIDE:
+        if prc in price_to_buy_idx:
+            li = price_to_buy_idx[prc]
+            buy_size_levels[li] += shr
+        else:
+            if n_buy_levels < MAX_LEVELS:
+                buy_price_levels[n_buy_levels] = prc
+                buy_size_levels[n_buy_levels] = shr
+                buy_level_used[n_buy_levels] = True
+                price_to_buy_idx[prc] = uint64(n_buy_levels)
+                n_buy_levels += 1
+    else:
+        if prc in price_to_sell_idx:
+            li = price_to_sell_idx[prc]
+            sell_size_levels[li] += shr
+        else:
+            if n_sell_levels < MAX_LEVELS:
+                sell_price_levels[n_sell_levels] = prc
+                sell_size_levels[n_sell_levels] = shr
+                sell_level_used[n_sell_levels] = True
+                price_to_sell_idx[prc] = uint64(n_sell_levels)
+                n_sell_levels += 1
+
+    return n_buy_levels, n_sell_levels
+
+
+@njit
+def _lru_evict(
+    current_ts, lru_window_us, stats,
+    order_map_id, order_map_shares, order_map_price, order_map_side,
+    order_map_used, order_map_last_ts, n_orders, id_to_idx,
+    buy_price_levels, buy_size_levels, buy_level_used, n_buy_levels, price_to_buy_idx,
+    sell_price_levels, sell_size_levels, sell_level_used, n_sell_levels, price_to_sell_idx,
+):
+    cutoff_ts = current_ts - lru_window_us
+    evicted = uint64(0)
+
+    for oi in range(n_orders):
+        if not order_map_used[oi]:
+            continue
+        if order_map_last_ts[oi] < cutoff_ts:
+            oid = order_map_id[oi]
+            side = order_map_side[oi]
+            prc = order_map_price[oi]
+            shr = order_map_shares[oi]
+
+            order_map_used[oi] = False
+            if oid in id_to_idx:
+                del id_to_idx[oid]
+
+            n_buy_levels, n_sell_levels = _remove_order_from_price_level(
+                prc, shr, side,
+                buy_price_levels, buy_size_levels, buy_level_used, n_buy_levels, price_to_buy_idx,
+                sell_price_levels, sell_size_levels, sell_level_used, n_sell_levels, price_to_sell_idx,
+            )
+            evicted += uint64(1)
+
+    stats[STAT_N_LRU_EVICTED] += evicted
+    return n_buy_levels, n_sell_levels
+
+
+@njit
+def _compact_order_arrays(
+    order_map_id, order_map_shares, order_map_price, order_map_side,
+    order_map_used, order_map_last_ts, n_orders, id_to_idx,
+):
+    write_idx = 0
+    for read_idx in range(n_orders):
+        if order_map_used[read_idx]:
+            if write_idx != read_idx:
+                order_map_id[write_idx] = order_map_id[read_idx]
+                order_map_shares[write_idx] = order_map_shares[read_idx]
+                order_map_price[write_idx] = order_map_price[read_idx]
+                order_map_side[write_idx] = order_map_side[read_idx]
+                order_map_used[write_idx] = True
+                order_map_last_ts[write_idx] = order_map_last_ts[read_idx]
+                oid = order_map_id[write_idx]
+                id_to_idx[oid] = uint64(write_idx)
+            write_idx += 1
+    for i in range(write_idx, n_orders):
+        order_map_used[i] = False
+    return write_idx
+
+
+@njit
 def _process_messages_numba(
     msg_types,
     timestamps,
@@ -135,20 +260,35 @@ def _process_messages_numba(
     new_order_ids,
     snapshot_interval,
     max_snapshots,
+    lru_window_us,
+    lru_max_orders,
 ):
     """
-    Numba JIT 编译的订单簿状态机核心
+    Numba JIT 编译的订单簿状态机核心（带 LRU 滑动窗口淘汰 + 优雅容错）
 
-    使用数组而非字典存储订单，以获得最佳内存访问局部性和性能。
+    LRU 机制：
+      - 每笔订单维护 last_ts（最后被触碰时间戳）
+      - 每隔 EVICTION_CHECK_INTERVAL 条消息检查 n_orders 是否超过 lru_max_orders
+      - 触发淘汰时扫描所有活跃订单，移除 last_ts < (current_ts - lru_window_us) 的订单
+      - 移除订单同时从对应价位扣除挂单量
+      - 移除完毕后压缩数组空位，释放索引空间
+
+    容错机制：
+      - Execute/Cancel/Delete/Replace 找不到订单引用时：静默跳过并计数
+      - 绝不抛出 KeyError 或中断整个推演进程
+      - 所有错误通过 stats 数组回传给 Python 层
     """
-    MAX_ORDERS = max(1000000, len(msg_types) * 2)
-    MAX_LEVELS = max(100000, len(msg_types))
+    n_msgs_input = len(msg_types)
 
-    order_map_id = np.zeros(MAX_ORDERS, dtype=np.uint64)
-    order_map_shares = np.zeros(MAX_ORDERS, dtype=np.uint64)
-    order_map_price = np.zeros(MAX_ORDERS, dtype=np.uint64)
-    order_map_side = np.zeros(MAX_ORDERS, dtype=np.uint8)
-    order_map_used = np.zeros(MAX_ORDERS, dtype=np.bool_)
+    MAX_ORDERS_ARR = max(lru_max_orders * 4, 2_000_000)
+    MAX_LEVELS = max(500_000, n_msgs_input // 10)
+
+    order_map_id = np.zeros(MAX_ORDERS_ARR, dtype=np.uint64)
+    order_map_shares = np.zeros(MAX_ORDERS_ARR, dtype=np.uint64)
+    order_map_price = np.zeros(MAX_ORDERS_ARR, dtype=np.uint64)
+    order_map_side = np.zeros(MAX_ORDERS_ARR, dtype=np.uint8)
+    order_map_used = np.zeros(MAX_ORDERS_ARR, dtype=np.bool_)
+    order_map_last_ts = np.zeros(MAX_ORDERS_ARR, dtype=np.uint64)
 
     n_orders = 0
     id_to_idx = NumbaDict.empty(key_type=uint64, value_type=uint64)
@@ -166,7 +306,9 @@ def _process_messages_numba(
     price_to_buy_idx = NumbaDict.empty(key_type=uint64, value_type=uint64)
     price_to_sell_idx = NumbaDict.empty(key_type=uint64, value_type=uint64)
 
-    n_msgs = len(msg_types)
+    stats = np.zeros(STATS_SIZE, dtype=np.uint64)
+
+    n_msgs = n_msgs_input
 
     snap_timestamps = np.zeros(max_snapshots, dtype=np.uint64)
     snap_bid_prices = np.zeros((max_snapshots, DEPTH_LEVELS), dtype=np.uint64)
@@ -184,139 +326,138 @@ def _process_messages_numba(
         ts = timestamps[i]
         oid = order_ids[i]
 
+        stats[STAT_N_MSGS_PROCESSED] = uint64(i + 1)
+
+        should_check_lru = False
+        if i % EVICTION_CHECK_INTERVAL == 0 and i > 0:
+            should_check_lru = True
+
         if mtype == MSG_ADD:
             side = sides[i]
             shr = uint64(shares[i])
             prc = prices[i]
 
-            order_map_id[n_orders] = oid
-            order_map_shares[n_orders] = shr
-            order_map_price[n_orders] = prc
-            order_map_side[n_orders] = side
-            order_map_used[n_orders] = True
-            id_to_idx[oid] = uint64(n_orders)
-            n_orders += 1
+            if n_orders < MAX_ORDERS_ARR:
+                order_map_id[n_orders] = oid
+                order_map_shares[n_orders] = shr
+                order_map_price[n_orders] = prc
+                order_map_side[n_orders] = side
+                order_map_used[n_orders] = True
+                order_map_last_ts[n_orders] = ts
+                id_to_idx[oid] = uint64(n_orders)
+                n_orders += 1
 
-            if side == BUY_SIDE:
-                if prc in price_to_buy_idx:
-                    li = price_to_buy_idx[prc]
-                    buy_size_levels[li] += shr
-                else:
-                    buy_price_levels[n_buy_levels] = prc
-                    buy_size_levels[n_buy_levels] = shr
-                    buy_level_used[n_buy_levels] = True
-                    price_to_buy_idx[prc] = uint64(n_buy_levels)
-                    n_buy_levels += 1
-            else:
-                if prc in price_to_sell_idx:
-                    li = price_to_sell_idx[prc]
-                    sell_size_levels[li] += shr
-                else:
-                    sell_price_levels[n_sell_levels] = prc
-                    sell_size_levels[n_sell_levels] = shr
-                    sell_level_used[n_sell_levels] = True
-                    price_to_sell_idx[prc] = uint64(n_sell_levels)
-                    n_sell_levels += 1
+                n_buy_levels, n_sell_levels = _add_order_to_price_level(
+                    prc, shr, side,
+                    buy_price_levels, buy_size_levels, buy_level_used, n_buy_levels, price_to_buy_idx,
+                    sell_price_levels, sell_size_levels, sell_level_used, n_sell_levels, price_to_sell_idx,
+                    MAX_LEVELS,
+                )
 
-        elif mtype == MSG_EXECUTE:
+            if n_orders >= lru_max_orders:
+                should_check_lru = True
+
+        if should_check_lru:
+            if n_orders >= lru_max_orders:
+                n_buy_levels, n_sell_levels = _lru_evict(
+                    ts, lru_window_us, stats,
+                    order_map_id, order_map_shares, order_map_price, order_map_side,
+                    order_map_used, order_map_last_ts, n_orders, id_to_idx,
+                    buy_price_levels, buy_size_levels, buy_level_used, n_buy_levels, price_to_buy_idx,
+                    sell_price_levels, sell_size_levels, sell_level_used, n_sell_levels, price_to_sell_idx,
+                )
+                n_orders = _compact_order_arrays(
+                    order_map_id, order_map_shares, order_map_price, order_map_side,
+                    order_map_used, order_map_last_ts, n_orders, id_to_idx,
+                )
+
+            if n_orders > stats[STAT_N_ORDERS_PEAK]:
+                stats[STAT_N_ORDERS_PEAK] = uint64(n_orders)
+            total_levels = n_buy_levels + n_sell_levels
+            if total_levels > stats[STAT_N_PRICE_LEVELS_PEAK]:
+                stats[STAT_N_PRICE_LEVELS_PEAK] = uint64(total_levels)
+
+        if mtype == MSG_EXECUTE:
             shr = uint64(shares[i])
             if oid in id_to_idx:
                 oi = id_to_idx[oid]
-                if not order_map_used[oi]:
-                    continue
-                side = order_map_side[oi]
-                prc = order_map_price[oi]
-                old_shares = order_map_shares[oi]
-                new_shares = old_shares - shr
-                if new_shares <= 0:
-                    order_map_used[oi] = False
-                    del id_to_idx[oid]
-                    new_shares = uint64(0)
-                order_map_shares[oi] = new_shares
+                if order_map_used[oi]:
+                    side = order_map_side[oi]
+                    prc = order_map_price[oi]
+                    old_shares = order_map_shares[oi]
+                    order_map_last_ts[oi] = ts
 
-                if side == BUY_SIDE:
-                    if prc in price_to_buy_idx:
-                        li = price_to_buy_idx[prc]
-                        buy_size_levels[li] -= shr
-                        if buy_size_levels[li] <= 0:
-                            buy_size_levels[li] = uint64(0)
-                            buy_level_used[li] = False
-                            del price_to_buy_idx[prc]
-                else:
-                    if prc in price_to_sell_idx:
-                        li = price_to_sell_idx[prc]
-                        sell_size_levels[li] -= shr
-                        if sell_size_levels[li] <= 0:
-                            sell_size_levels[li] = uint64(0)
-                            sell_level_used[li] = False
-                            del price_to_sell_idx[prc]
+                    actual_shr = shr
+                    if actual_shr > old_shares:
+                        actual_shr = old_shares
+                    new_shares = old_shares - actual_shr
+                    if new_shares <= 0:
+                        order_map_used[oi] = False
+                        if oid in id_to_idx:
+                            del id_to_idx[oid]
+                        new_shares = uint64(0)
+                    order_map_shares[oi] = new_shares
+
+                    n_buy_levels, n_sell_levels = _remove_order_from_price_level(
+                        prc, actual_shr, side,
+                        buy_price_levels, buy_size_levels, buy_level_used, n_buy_levels, price_to_buy_idx,
+                        sell_price_levels, sell_size_levels, sell_level_used, n_sell_levels, price_to_sell_idx,
+                    )
+            else:
+                stats[STAT_N_MISSING_EXECUTE] += uint64(1)
 
         elif mtype == MSG_CANCEL:
             shr = uint64(shares[i])
             if oid in id_to_idx:
                 oi = id_to_idx[oid]
-                if not order_map_used[oi]:
-                    continue
-                side = order_map_side[oi]
-                prc = order_map_price[oi]
-                old_shares = order_map_shares[oi]
-                new_shares = old_shares - shr
-                if new_shares <= 0:
-                    order_map_used[oi] = False
-                    del id_to_idx[oid]
-                    new_shares = uint64(0)
-                order_map_shares[oi] = new_shares
+                if order_map_used[oi]:
+                    side = order_map_side[oi]
+                    prc = order_map_price[oi]
+                    old_shares = order_map_shares[oi]
+                    order_map_last_ts[oi] = ts
 
-                if side == BUY_SIDE:
-                    if prc in price_to_buy_idx:
-                        li = price_to_buy_idx[prc]
-                        buy_size_levels[li] -= shr
-                        if buy_size_levels[li] <= 0:
-                            buy_size_levels[li] = uint64(0)
-                            buy_level_used[li] = False
-                            del price_to_buy_idx[prc]
-                else:
-                    if prc in price_to_sell_idx:
-                        li = price_to_sell_idx[prc]
-                        sell_size_levels[li] -= shr
-                        if sell_size_levels[li] <= 0:
-                            sell_size_levels[li] = uint64(0)
-                            sell_level_used[li] = False
-                            del price_to_sell_idx[prc]
+                    actual_shr = shr
+                    if actual_shr > old_shares:
+                        actual_shr = old_shares
+                    new_shares = old_shares - actual_shr
+                    if new_shares <= 0:
+                        order_map_used[oi] = False
+                        if oid in id_to_idx:
+                            del id_to_idx[oid]
+                        new_shares = uint64(0)
+                    order_map_shares[oi] = new_shares
+
+                    n_buy_levels, n_sell_levels = _remove_order_from_price_level(
+                        prc, actual_shr, side,
+                        buy_price_levels, buy_size_levels, buy_level_used, n_buy_levels, price_to_buy_idx,
+                        sell_price_levels, sell_size_levels, sell_level_used, n_sell_levels, price_to_sell_idx,
+                    )
+            else:
+                stats[STAT_N_MISSING_CANCEL] += uint64(1)
 
         elif mtype == MSG_DELETE:
             if oid in id_to_idx:
                 oi = id_to_idx[oid]
-                if not order_map_used[oi]:
-                    continue
-                side = order_map_side[oi]
-                prc = order_map_price[oi]
-                shr = order_map_shares[oi]
-                order_map_used[oi] = False
-                del id_to_idx[oid]
+                if order_map_used[oi]:
+                    side = order_map_side[oi]
+                    prc = order_map_price[oi]
+                    shr = order_map_shares[oi]
+                    order_map_used[oi] = False
+                    if oid in id_to_idx:
+                        del id_to_idx[oid]
 
-                if side == BUY_SIDE:
-                    if prc in price_to_buy_idx:
-                        li = price_to_buy_idx[prc]
-                        buy_size_levels[li] -= shr
-                        if buy_size_levels[li] <= 0:
-                            buy_size_levels[li] = uint64(0)
-                            buy_level_used[li] = False
-                            del price_to_buy_idx[prc]
-                else:
-                    if prc in price_to_sell_idx:
-                        li = price_to_sell_idx[prc]
-                        sell_size_levels[li] -= shr
-                        if sell_size_levels[li] <= 0:
-                            sell_size_levels[li] = uint64(0)
-                            sell_level_used[li] = False
-                            del price_to_sell_idx[prc]
+                    n_buy_levels, n_sell_levels = _remove_order_from_price_level(
+                        prc, shr, side,
+                        buy_price_levels, buy_size_levels, buy_level_used, n_buy_levels, price_to_buy_idx,
+                        sell_price_levels, sell_size_levels, sell_level_used, n_sell_levels, price_to_sell_idx,
+                    )
+            else:
+                stats[STAT_N_MISSING_DELETE] += uint64(1)
 
         elif mtype == MSG_REPLACE:
             new_oid = new_order_ids[i]
-            side = uint8(0)
-            old_prc = uint64(0)
-            old_shr = uint64(0)
+            new_shr = uint64(shares[i])
+            new_prc = prices[i]
 
             if oid in id_to_idx:
                 oi = id_to_idx[oid]
@@ -325,56 +466,33 @@ def _process_messages_numba(
                     old_prc = order_map_price[oi]
                     old_shr = order_map_shares[oi]
                     order_map_used[oi] = False
-                    del id_to_idx[oid]
+                    if oid in id_to_idx:
+                        del id_to_idx[oid]
 
-            new_shr = uint64(shares[i])
-            new_prc = prices[i]
+                    n_buy_levels, n_sell_levels = _remove_order_from_price_level(
+                        old_prc, old_shr, side,
+                        buy_price_levels, buy_size_levels, buy_level_used, n_buy_levels, price_to_buy_idx,
+                        sell_price_levels, sell_size_levels, sell_level_used, n_sell_levels, price_to_sell_idx,
+                    )
 
-            order_map_id[n_orders] = new_oid
-            order_map_shares[n_orders] = new_shr
-            order_map_price[n_orders] = new_prc
-            order_map_side[n_orders] = side
-            order_map_used[n_orders] = True
-            id_to_idx[new_oid] = uint64(n_orders)
-            n_orders += 1
+                    if n_orders < MAX_ORDERS_ARR:
+                        order_map_id[n_orders] = new_oid
+                        order_map_shares[n_orders] = new_shr
+                        order_map_price[n_orders] = new_prc
+                        order_map_side[n_orders] = side
+                        order_map_used[n_orders] = True
+                        order_map_last_ts[n_orders] = ts
+                        id_to_idx[new_oid] = uint64(n_orders)
+                        n_orders += 1
 
-            if side > 0 and old_shr > 0:
-                if side == BUY_SIDE:
-                    if old_prc in price_to_buy_idx:
-                        li = price_to_buy_idx[old_prc]
-                        buy_size_levels[li] -= old_shr
-                        if buy_size_levels[li] <= 0:
-                            buy_size_levels[li] = uint64(0)
-                            buy_level_used[li] = False
-                            del price_to_buy_idx[old_prc]
-
-                    if new_prc in price_to_buy_idx:
-                        li = price_to_buy_idx[new_prc]
-                        buy_size_levels[li] += new_shr
-                    else:
-                        buy_price_levels[n_buy_levels] = new_prc
-                        buy_size_levels[n_buy_levels] = new_shr
-                        buy_level_used[n_buy_levels] = True
-                        price_to_buy_idx[new_prc] = uint64(n_buy_levels)
-                        n_buy_levels += 1
-                else:
-                    if old_prc in price_to_sell_idx:
-                        li = price_to_sell_idx[old_prc]
-                        sell_size_levels[li] -= old_shr
-                        if sell_size_levels[li] <= 0:
-                            sell_size_levels[li] = uint64(0)
-                            sell_level_used[li] = False
-                            del price_to_sell_idx[old_prc]
-
-                    if new_prc in price_to_sell_idx:
-                        li = price_to_sell_idx[new_prc]
-                        sell_size_levels[li] += new_shr
-                    else:
-                        sell_price_levels[n_sell_levels] = new_prc
-                        sell_size_levels[n_sell_levels] = new_shr
-                        sell_level_used[n_sell_levels] = True
-                        price_to_sell_idx[new_prc] = uint64(n_sell_levels)
-                        n_sell_levels += 1
+                        n_buy_levels, n_sell_levels = _add_order_to_price_level(
+                            new_prc, new_shr, side,
+                            buy_price_levels, buy_size_levels, buy_level_used, n_buy_levels, price_to_buy_idx,
+                            sell_price_levels, sell_size_levels, sell_level_used, n_sell_levels, price_to_sell_idx,
+                            MAX_LEVELS,
+                        )
+            else:
+                stats[STAT_N_MISSING_REPLACE] += uint64(1)
 
         if snapshot_interval > 0 and ts - last_snapshot_ts >= snapshot_interval:
             if n_snapshots < max_snapshots:
@@ -431,6 +549,12 @@ def _process_messages_numba(
                 n_snapshots += 1
                 last_snapshot_ts = ts
 
+    if n_orders > stats[STAT_N_ORDERS_PEAK]:
+        stats[STAT_N_ORDERS_PEAK] = uint64(n_orders)
+    total_levels = n_buy_levels + n_sell_levels
+    if total_levels > stats[STAT_N_PRICE_LEVELS_PEAK]:
+        stats[STAT_N_PRICE_LEVELS_PEAK] = uint64(total_levels)
+
     return (
         snap_timestamps[:n_snapshots],
         snap_bid_prices[:n_snapshots],
@@ -439,7 +563,51 @@ def _process_messages_numba(
         snap_ask_sizes[:n_snapshots],
         snap_spread[:n_snapshots],
         snap_midprice[:n_snapshots],
+        stats,
     )
+
+
+@dataclass
+class ReconstructionStats:
+    """订单簿重建过程统计信息（用于诊断 LRU 淘汰和容错情况）"""
+
+    n_messages_processed: int = 0
+    n_orders_peak: int = 0
+    n_price_levels_peak: int = 0
+    n_lru_evicted: int = 0
+    n_missing_execute: int = 0
+    n_missing_cancel: int = 0
+    n_missing_delete: int = 0
+    n_missing_replace: int = 0
+
+    @property
+    def total_missing(self) -> int:
+        return (
+            self.n_missing_execute
+            + self.n_missing_cancel
+            + self.n_missing_delete
+            + self.n_missing_replace
+        )
+
+    @property
+    def missing_rate(self) -> float:
+        if self.n_messages_processed == 0:
+            return 0.0
+        return self.total_missing / float(self.n_messages_processed)
+
+    def __repr__(self) -> str:
+        return (
+            f"ReconstructionStats("
+            f"msgs={self.n_messages_processed}, "
+            f"orders_peak={self.n_orders_peak}, "
+            f"levels_peak={self.n_price_levels_peak}, "
+            f"lru_evicted={self.n_lru_evicted}, "
+            f"missing_exe={self.n_missing_execute}, "
+            f"missing_cxl={self.n_missing_cancel}, "
+            f"missing_del={self.n_missing_delete}, "
+            f"missing_rep={self.n_missing_replace}, "
+            f"missing_rate={self.missing_rate:.4%})"
+        )
 
 
 @dataclass
@@ -473,13 +641,29 @@ class OrderBookSnapshot:
 
 class L3OrderBook:
     """
-    L3 逐笔订单簿重构引擎
+    L3 逐笔订单簿重构引擎（带 LRU 滑动窗口淘汰 + 优雅容错）
 
     使用 Numba JIT 编译的状态机处理全量 ITCH 消息，
     还原出十档买卖盘深度及价差、中间价等微观结构指标。
+
+    LRU 机制说明：
+      - 对于连续多个交易日加载（含 GTC/GTD 隔夜挂单）场景，
+        只要订单在 lru_window_us 时间窗口内被触碰过（新增/成交/撤销/修改），
+        就不会被淘汰，因此隔夜挂单在新交易日被操作时可以正常匹配。
+      - 超过 lru_window_us 未被触碰的订单会被自动淘汰，防止内存无限增长。
+
+    容错机制说明：
+      - 找不到订单引用时（Execute/Cancel/Delete/Replace），
+        自动跳过该条消息并统计到 ReconstructionStats 中，绝不会中断推演。
     """
 
-    def __init__(self, snapshot_interval_us: int = 1_000_000, max_snapshots: int = 10_000_000):
+    def __init__(
+        self,
+        snapshot_interval_us: int = 1_000_000,
+        max_snapshots: int = 10_000_000,
+        lru_window_us: int = int(DEFAULT_LRU_WINDOW_US),
+        lru_max_orders: int = 500_000,
+    ):
         """
         Parameters
         ----------
@@ -487,10 +671,19 @@ class L3OrderBook:
             快照采样间隔（微秒），默认 1ms
         max_snapshots : int
             最大快照数量（防止内存溢出）
+        lru_window_us : int
+            LRU 滑动窗口大小（微秒），默认 6 小时。
+            超过该窗口未被触碰的订单将被自动淘汰。
+        lru_max_orders : int
+            LRU 触发淘汰的阈值订单数，默认 50 万。
+            当活跃订单数超过该值时开始扫描淘汰。
         """
         self.snapshot_interval_us = snapshot_interval_us
         self.max_snapshots = max_snapshots
+        self.lru_window_us = lru_window_us
+        self.lru_max_orders = lru_max_orders
         self.snapshots: List[OrderBookSnapshot] = []
+        self.stats: ReconstructionStats = ReconstructionStats()
         self._msg_types: List[np.uint8] = []
         self._timestamps: List[np.uint64] = []
         self._order_ids: List[np.uint64] = []
@@ -499,7 +692,7 @@ class L3OrderBook:
         self._prices: List[np.uint64] = []
         self._new_order_ids: List[np.uint64] = []
 
-    def ingest_parsed_messages(self, parsed_data: dict) -> None:
+    def ingest_parsed_messages(self, parsed_data: dict, append: bool = False) -> None:
         """
         从 ITCHParser 解析结果导入消息
 
@@ -507,14 +700,18 @@ class L3OrderBook:
         ----------
         parsed_data : dict
             ITCHParser.to_polars() 返回的 DataFrame 字典
+        append : bool
+            是否追加到已有消息（用于多日连续加载）。
+            False（默认）= 清空后重新加载；True = 追加到现有消息流尾部。
         """
-        self._msg_types.clear()
-        self._timestamps.clear()
-        self._order_ids.clear()
-        self._sides.clear()
-        self._shares.clear()
-        self._prices.clear()
-        self._new_order_ids.clear()
+        if not append:
+            self._msg_types.clear()
+            self._timestamps.clear()
+            self._order_ids.clear()
+            self._sides.clear()
+            self._shares.clear()
+            self._prices.clear()
+            self._new_order_ids.clear()
 
         msgs: List[Tuple] = []
 
@@ -604,14 +801,20 @@ class L3OrderBook:
             self._prices.append(np.uint64(prc))
             self._new_order_ids.append(np.uint64(new_oid))
 
-    def build(self) -> None:
+    def build(self) -> ReconstructionStats:
         """
         执行 Numba JIT 加速的订单簿重建
 
         处理所有已导入的消息，生成十档深度快照序列。
+
+        Returns
+        -------
+        ReconstructionStats
+            重建过程的统计诊断信息（LRU 淘汰数、缺失订单引用数等）
         """
         if not self._msg_types:
-            return
+            self.stats = ReconstructionStats()
+            return self.stats
 
         msg_types = np.array(self._msg_types, dtype=np.uint8)
         timestamps = np.array(self._timestamps, dtype=np.uint64)
@@ -629,6 +832,7 @@ class L3OrderBook:
             snap_as_,
             snap_spread,
             snap_mid,
+            raw_stats,
         ) = _process_messages_numba(
             msg_types,
             timestamps,
@@ -639,6 +843,19 @@ class L3OrderBook:
             new_order_ids,
             uint64(self.snapshot_interval_us),
             self.max_snapshots,
+            uint64(self.lru_window_us),
+            self.lru_max_orders,
+        )
+
+        self.stats = ReconstructionStats(
+            n_messages_processed=int(raw_stats[STAT_N_MSGS_PROCESSED]),
+            n_orders_peak=int(raw_stats[STAT_N_ORDERS_PEAK]),
+            n_price_levels_peak=int(raw_stats[STAT_N_PRICE_LEVELS_PEAK]),
+            n_lru_evicted=int(raw_stats[STAT_N_LRU_EVICTED]),
+            n_missing_execute=int(raw_stats[STAT_N_MISSING_EXECUTE]),
+            n_missing_cancel=int(raw_stats[STAT_N_MISSING_CANCEL]),
+            n_missing_delete=int(raw_stats[STAT_N_MISSING_DELETE]),
+            n_missing_replace=int(raw_stats[STAT_N_MISSING_REPLACE]),
         )
 
         self.snapshots = []
@@ -654,6 +871,8 @@ class L3OrderBook:
                     midprice=float(snap_mid[i]),
                 )
             )
+
+        return self.stats
 
     def to_polars(self) -> "pl.DataFrame":
         """

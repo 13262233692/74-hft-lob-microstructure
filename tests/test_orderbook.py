@@ -171,10 +171,244 @@ def test_performance_benchmark():
 import polars as pl
 
 
+def test_overnight_gtc_orders_multi_day():
+    """
+    测试多日连续加载 + 隔夜 GTC 挂单场景
+
+    场景：
+      - Day 1 (10:00 ~ 14:00): 下单 BID @100.00 100股 (GTC 未成交)
+      - 隔夜间隔 (14:00 ~ 次日 09:30): 订单保留
+      - Day 2 (09:30 ~ 10:00): 新交易日该订单被 EXECUTE 成交 100股
+    预期：不会抛出 KeyError，EXECUTE 能正确找到订单并扣减
+    """
+    import polars as pl
+
+    DAY1_START = 1717200000_000000  # 2024-06-01 10:00:00 UTC (us)
+    DAY1_END = 1717214400_000000    # 2024-06-01 14:00:00 UTC
+    DAY2_START = 1717282200_000000  # 2024-06-02 09:30:00 UTC
+
+    GTC_ORDER_ID = 99999999
+    GTC_PRICE_INT = 1000000  # 100.0000
+    GTC_SHARES = 100
+
+    add_orders = pl.DataFrame({
+        "timestamp": [DAY1_START + 1_000_000],
+        "order_id": [GTC_ORDER_ID],
+        "side": [66],  # 'B'
+        "shares": [GTC_SHARES],
+        "stock": ["TEST"],
+        "price": [GTC_PRICE_INT],
+    })
+
+    order_executes = pl.DataFrame({
+        "timestamp": [DAY2_START + 2_000_000],
+        "order_id": [GTC_ORDER_ID],
+        "shares": [GTC_SHARES],
+        "match_number": [1],
+    }, schema={
+        "timestamp": pl.UInt64,
+        "order_id": pl.UInt64,
+        "shares": pl.UInt32,
+        "match_number": pl.UInt64,
+    })
+
+    parsed = {
+        "add_orders": add_orders,
+        "order_executes": order_executes,
+    }
+
+    ob = L3OrderBook(
+        snapshot_interval_us=1_000_000,
+        max_snapshots=100_000,
+        lru_window_us=48 * 3600 * 1_000_000,  # 48h 窗口，确保隔夜订单存活
+        lru_max_orders=1_000,
+    )
+    ob.ingest_parsed_messages(parsed)
+    stats = ob.build()
+
+    assert stats.n_missing_execute == 0, (
+        f"隔夜 GTC 订单执行时找不到引用，missing_execute={stats.n_missing_execute}"
+    )
+    assert stats.total_missing == 0, f"不应有任何缺失引用，实际={stats.total_missing}"
+
+    snapshots_df = ob.to_polars()
+    print(f"  隔夜测试快照数: {len(snapshots_df)}")
+    print(f"  {stats}")
+    print("[PASS] test_overnight_gtc_orders_multi_day")
+
+
+def test_lru_eviction_sliding_window():
+    """
+    测试 LRU 滑动窗口淘汰机制
+
+    场景：
+      - t=0ms: Add 订单A @100.00 100股
+      - t=1ms: Add 订单B @100.01 100股
+      - t=2ms: Add 订单C @100.02 100股
+      - 窗口=3ms，lru_max_orders=2
+      - t=4ms: 超过阈值，触发淘汰，last_ts < (4ms - 3ms) = 1ms 的订单 A 应被淘汰
+    预期：LRU 淘汰计数 > 0，且被淘汰订单后续操作会计入 missing
+    """
+    import polars as pl
+
+    T0 = 1_000_000  # 1ms
+    T1 = 2_000_000  # 2ms
+    T2 = 3_000_000  # 3ms
+    T_TRIGGER = 6_000_000  # 6ms 触发淘汰，cutoff = 6ms - 3ms = 3ms
+
+    add_orders = pl.DataFrame({
+        "timestamp": [T0, T1, T2],
+        "order_id": [1001, 1002, 1003],
+        "side": [66, 66, 66],
+        "shares": [100, 100, 100],
+        "stock": ["TEST", "TEST", "TEST"],
+        "price": [1000000, 1000100, 1000200],
+    })
+
+    order_deletes = pl.DataFrame({
+        "timestamp": [T_TRIGGER + 1_000_000],
+        "order_id": [1001],  # 订单A 已被 LRU 淘汰
+    }, schema={
+        "timestamp": pl.UInt64,
+        "order_id": pl.UInt64,
+    })
+
+    parsed = {
+        "add_orders": add_orders,
+        "order_deletes": order_deletes,
+    }
+
+    ob = L3OrderBook(
+        snapshot_interval_us=10_000_000,
+        max_snapshots=100,
+        lru_window_us=3_000_000,   # 3ms 窗口
+        lru_max_orders=2,           # 超过 2 单触发淘汰
+    )
+    ob.ingest_parsed_messages(parsed)
+    stats = ob.build()
+
+    assert stats.n_lru_evicted >= 1, (
+        f"LRU 应至少淘汰 1 笔过期订单，实际={stats.n_lru_evicted}"
+    )
+    assert stats.n_missing_delete >= 1, (
+        f"过期订单被淘汰后 Delete 应计为 missing，实际={stats.n_missing_delete}"
+    )
+    print(f"  LRU 淘汰: {stats.n_lru_evicted}")
+    print(f"  Missing Delete: {stats.n_missing_delete}")
+    print(f"  {stats}")
+    print("[PASS] test_lru_eviction_sliding_window")
+
+
+def test_graceful_error_handling_no_crash():
+    """
+    测试优雅容错：引用不存在订单时不崩溃，仅记录统计
+
+    场景：
+      - 直接发送 Execute/Cancel/Delete/Replace 各 1 条，引用完全不存在的订单号
+    预期：
+      - 不抛出 KeyError / Exception
+      - stats 中对应 missing 计数器各 +1
+      - 订单簿推演继续进行，后续正常订单仍可处理
+    """
+    import polars as pl
+
+    TS = 1_000_000
+
+    order_executes = pl.DataFrame({
+        "timestamp": [TS],
+        "order_id": [88880001],
+        "shares": [10],
+        "match_number": [1],
+    }, schema={
+        "timestamp": pl.UInt64,
+        "order_id": pl.UInt64,
+        "shares": pl.UInt32,
+        "match_number": pl.UInt64,
+    })
+
+    order_cancels = pl.DataFrame({
+        "timestamp": [TS + 1_000],
+        "order_id": [88880002],
+        "canceled_shares": [10],
+    }, schema={
+        "timestamp": pl.UInt64,
+        "order_id": pl.UInt64,
+        "canceled_shares": pl.UInt32,
+    })
+
+    order_deletes = pl.DataFrame({
+        "timestamp": [TS + 2_000],
+        "order_id": [88880003],
+    }, schema={
+        "timestamp": pl.UInt64,
+        "order_id": pl.UInt64,
+    })
+
+    order_replaces = pl.DataFrame({
+        "timestamp": [TS + 3_000],
+        "original_order_id": [88880004],
+        "new_order_id": [88880005],
+        "shares": [50],
+        "price": [990000],
+    }, schema={
+        "timestamp": pl.UInt64,
+        "original_order_id": pl.UInt64,
+        "new_order_id": pl.UInt64,
+        "shares": pl.UInt32,
+        "price": pl.UInt64,
+    })
+
+    good_add = pl.DataFrame({
+        "timestamp": [TS + 10_000],
+        "order_id": [77770001],
+        "side": [83],  # 'S'
+        "shares": [200],
+        "stock": ["TEST"],
+        "price": [1010000],
+    })
+
+    parsed = {
+        "order_executes": order_executes,
+        "order_cancels": order_cancels,
+        "order_deletes": order_deletes,
+        "order_replaces": order_replaces,
+        "add_orders": good_add,
+    }
+
+    ob = L3OrderBook(
+        snapshot_interval_us=100_000,
+        max_snapshots=10_000,
+    )
+    ob.ingest_parsed_messages(parsed)
+    stats = ob.build()
+
+    assert stats.n_missing_execute == 1, f"Execute missing 计数应为 1，实际={stats.n_missing_execute}"
+    assert stats.n_missing_cancel == 1, f"Cancel missing 计数应为 1，实际={stats.n_missing_cancel}"
+    assert stats.n_missing_delete == 1, f"Delete missing 计数应为 1，实际={stats.n_missing_delete}"
+    assert stats.n_missing_replace == 1, f"Replace missing 计数应为 1，实际={stats.n_missing_replace}"
+    assert stats.total_missing == 4
+
+    snapshots_df = ob.to_polars()
+    assert len(snapshots_df) > 0, "后续正常订单仍应能生成快照"
+
+    assert stats.n_orders_peak >= 1, "正常添加的订单应能被追踪"
+    print(f"  Missing Execute: {stats.n_missing_execute}")
+    print(f"  Missing Cancel:  {stats.n_missing_cancel}")
+    print(f"  Missing Delete:  {stats.n_missing_delete}")
+    print(f"  Missing Replace: {stats.n_missing_replace}")
+    print(f"  正常订单峰值:    {stats.n_orders_peak}")
+    print(f"  推演未崩溃，快照数: {len(snapshots_df)}")
+    print(f"  {stats}")
+    print("[PASS] test_graceful_error_handling_no_crash")
+
+
 if __name__ == "__main__":
     test_orderbook_basic_reconstruction()
     test_spread_positive()
     test_order_imbalance_consistency()
     test_snapshot_prices_monotonic()
     test_performance_benchmark()
+    test_overnight_gtc_orders_multi_day()
+    test_lru_eviction_sliding_window()
+    test_graceful_error_handling_no_crash()
     print("\n所有 L3 OrderBook 测试通过!")

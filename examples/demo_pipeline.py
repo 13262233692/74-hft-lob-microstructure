@@ -36,10 +36,11 @@ def main():
     t0 = time.time()
     ob = L3OrderBook(snapshot_interval_us=snapshot_interval, max_snapshots=1_000_000)
     ob.ingest_parsed_messages(parsed)
-    ob.build()
+    stats = ob.build()
     t1 = time.time()
     snapshots_df = ob.to_polars()
     print(f"  重构完成，耗时 {t1 - t0:.3f}s")
+    print(f"  {stats}")
     print(f"  生成快照: {len(snapshots_df):,} 个")
     if len(snapshots_df) > 0:
         print(f"  首个快照 Best Bid/Ask: {snapshots_df['best_bid'][0]:.4f} / {snapshots_df['best_ask'][0]:.4f}")
