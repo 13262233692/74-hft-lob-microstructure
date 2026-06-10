@@ -683,3 +683,297 @@ class MicrostructureViz:
             fig.write_html(filepath)
         else:
             fig.write_image(filepath)
+
+    def plot_candlestick(
+        self,
+        ohlc_df: pl.DataFrame,
+        title: str = "K 线图",
+    ) -> "go.Figure":
+        """
+        绘制 K 线图（蜡烛图）
+
+        Parameters
+        ----------
+        ohlc_df : pl.DataFrame
+            包含 datetime, open, high, low, close, volume 的 K 线数据
+        title : str
+            图表标题
+
+        Returns
+        -------
+        go.Figure
+            Plotly 图表对象
+        """
+        _check_plotly()
+        if ohlc_df is None or ohlc_df.is_empty():
+            raise ValueError("请提供有效的 OHLC 数据")
+
+        fig = go.Figure()
+
+        fig.add_trace(
+            go.Candlestick(
+                x=ohlc_df["datetime"].to_list(),
+                open=ohlc_df["open"].to_list(),
+                high=ohlc_df["high"].to_list(),
+                low=ohlc_df["low"].to_list(),
+                close=ohlc_df["close"].to_list(),
+                name="价格",
+                increasing_line_color=GREEN_COLOR,
+                decreasing_line_color=RED_COLOR,
+                increasing_fillcolor=f"rgba(34, 197, 94, 0.3)",
+                decreasing_fillcolor=f"rgba(239, 68, 68, 0.3)",
+            )
+        )
+
+        if "volume" in ohlc_df.columns:
+            fig.add_trace(
+                go.Bar(
+                    x=ohlc_df["datetime"].to_list(),
+                    y=ohlc_df["volume"].to_list(),
+                    name="成交量",
+                    marker_color=BLUE_COLOR,
+                    opacity=0.4,
+                    yaxis="y2",
+                )
+            )
+
+        fig.update_layout(
+            title=dict(text=title, x=0.5),
+            xaxis_title="时间",
+            yaxis_title="价格",
+            height=500,
+            xaxis_rangeslider_visible=False,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+
+        if "volume" in ohlc_df.columns:
+            fig.update_layout(
+                yaxis2=dict(
+                    title="成交量",
+                    overlaying="y",
+                    side="right",
+                    showgrid=False,
+                ),
+            )
+
+        return _apply_dark_theme(fig)
+
+    def plot_vpin_with_candlestick(
+        self,
+        ohlc_df: pl.DataFrame,
+        vpin_result: "VPINResult",
+        title: str = "价格走势 & VPIN 知情交易概率",
+        stock: str = "",
+        vpin_threshold: float = 0.5,
+    ) -> "go.Figure":
+        """
+        绘制 K 线主图 + VPIN 知情交易概率副图的组合图表
+
+        VPIN 用于捕捉庄家砸盘前的异常买卖失衡。
+        当 VPIN 超过阈值（通常 0.5~0.8）时，表示市场存在异常知情交易，
+        可能预示着即将发生大幅单边行情（如砸盘或拉盘）。
+
+        Parameters
+        ----------
+        ohlc_df : pl.DataFrame
+            包含 datetime, open, high, low, close, volume 的 K 线数据
+        vpin_result : VPINResult
+            compute_vpin() 返回的 VPIN 计算结果
+        title : str
+            图表标题
+        stock : str
+            股票代码，用于副标题
+        vpin_threshold : float
+            VPIN 危险阈值，默认 0.5。超过该值的区域将用红色高亮标注
+
+        Returns
+        -------
+        go.Figure
+            Plotly 组合图表对象
+        """
+        _check_plotly()
+        if ohlc_df is None or ohlc_df.is_empty():
+            raise ValueError("请提供有效的 OHLC 数据")
+        if vpin_result.vpin_df is None or vpin_result.vpin_df.is_empty():
+            raise ValueError("请提供有效的 VPIN 结果")
+
+        vpin_df = vpin_result.vpin_df
+
+        fig = make_subplots(
+            rows=2,
+            cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.05,
+            subplot_titles=(
+                f"{stock} 价格走势" if stock else "价格走势",
+                f"VPIN 知情交易概率 (滚动窗口 {vpin_result.n_buckets if vpin_result.n_buckets < 50 else 50} 桶, 每桶约 {vpin_result.bucket_size:,} 股)",
+            ),
+            specs=[
+                [{"type": "candlestick"}],
+                [{"type": "scatter"}],
+            ],
+            row_heights=[0.65, 0.35],
+        )
+
+        fig.add_trace(
+            go.Candlestick(
+                x=ohlc_df["datetime"].to_list(),
+                open=ohlc_df["open"].to_list(),
+                high=ohlc_df["high"].to_list(),
+                low=ohlc_df["low"].to_list(),
+                close=ohlc_df["close"].to_list(),
+                name="价格",
+                increasing_line_color=GREEN_COLOR,
+                decreasing_line_color=RED_COLOR,
+                increasing_fillcolor=f"rgba(34, 197, 94, 0.3)",
+                decreasing_fillcolor=f"rgba(239, 68, 68, 0.3)",
+            ),
+            row=1,
+            col=1,
+        )
+
+        if "volume" in ohlc_df.columns:
+            fig.add_trace(
+                go.Bar(
+                    x=ohlc_df["datetime"].to_list(),
+                    y=ohlc_df["volume"].to_list(),
+                    name="成交量",
+                    marker_color=BLUE_COLOR,
+                    opacity=0.3,
+                    yaxis="y2",
+                ),
+                row=1,
+                col=1,
+            )
+
+        vpin_x = vpin_df["end_datetime"].to_list() if "end_datetime" in vpin_df.columns else vpin_df["start_datetime"].to_list()
+        vpin_y = vpin_df["vpin"].to_list()
+
+        fig.add_trace(
+            go.Scatter(
+                x=vpin_x,
+                y=vpin_y,
+                mode="lines",
+                name="VPIN",
+                line=dict(color=BLUE_COLOR, width=2),
+                fill="tozeroy",
+                fillcolor=f"rgba(59, 130, 246, 0.2)",
+            ),
+            row=2,
+            col=1,
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=vpin_x,
+                y=[vpin_threshold] * len(vpin_y),
+                mode="lines",
+                name=f"阈值 {vpin_threshold}",
+                line=dict(color=RED_COLOR, width=1, dash="dash"),
+            ),
+            row=2,
+            col=1,
+        )
+
+        high_vpin_mask = [v >= vpin_threshold for v in vpin_y]
+        if any(high_vpin_mask):
+            high_x = [vpin_x[i] for i in range(len(vpin_x)) if high_vpin_mask[i]]
+            high_y = [vpin_y[i] for i in range(len(vpin_y)) if high_vpin_mask[i]]
+            fig.add_trace(
+                go.Scatter(
+                    x=high_x,
+                    y=high_y,
+                    mode="markers",
+                    name="高风险区域",
+                    marker=dict(
+                        color=RED_COLOR,
+                        size=8,
+                        opacity=0.8,
+                        line=dict(width=1, color="#ffffff"),
+                    ),
+                ),
+                row=2,
+                col=1,
+            )
+
+        buy_vol = vpin_df["buy_volume"].to_list()
+        sell_vol = vpin_df["sell_volume"].to_list()
+
+        fig.add_trace(
+            go.Bar(
+                x=vpin_x,
+                y=buy_vol,
+                name="买方成交量",
+                marker_color=GREEN_COLOR,
+                opacity=0.25,
+                yaxis="y4",
+            ),
+            row=2,
+            col=1,
+        )
+        fig.add_trace(
+            go.Bar(
+                x=vpin_x,
+                y=[-v for v in sell_vol],
+                name="卖方成交量",
+                marker_color=RED_COLOR,
+                opacity=0.25,
+                yaxis="y4",
+            ),
+            row=2,
+            col=1,
+        )
+
+        fig.update_xaxes(
+            title_text="时间",
+            row=2,
+            col=1,
+            rangeslider_visible=False,
+        )
+        fig.update_yaxes(
+            title_text="价格",
+            row=1,
+            col=1,
+        )
+        fig.update_yaxes(
+            title_text="VPIN",
+            row=2,
+            col=1,
+            range=[0, max(1.0, float(max(vpin_y)) * 1.1) if vpin_y else [0, 1]],
+        )
+
+        if "volume" in ohlc_df.columns:
+            fig.update_layout(
+                yaxis2=dict(
+                    title="成交量",
+                    overlaying="y",
+                    side="right",
+                    showgrid=False,
+                ),
+                yaxis4=dict(
+                    title="买卖盘成交量",
+                    overlaying="y3",
+                    side="right",
+                    showgrid=False,
+                    showticklabels=False,
+                ),
+            )
+
+        fig.update_layout(
+            height=750,
+            title=dict(
+                text=f"{title}<br><sub>VPIN 均值: {vpin_result.avg_vpin:.4f}, 峰值: {vpin_result.max_vpin:.4f} | 总量桶: {vpin_result.n_buckets}, 桶容量: {vpin_result.bucket_size:,} 股</sub>",
+                x=0.5,
+                font=dict(size=14),
+            ),
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.005,
+                xanchor="right",
+                x=1,
+            ),
+            hovermode="x unified",
+        )
+
+        return _apply_dark_theme(fig)

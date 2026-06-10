@@ -644,12 +644,15 @@ class ITCHParser:
                         best_ask = price
 
             elif msg_choice < 0.6:
+                is_buy_side = False
                 if rng.random() < 0.5 and active_buy_orders:
                     order_id = rng.choice(list(active_buy_orders.keys()))
                     remaining_shares, price = active_buy_orders[order_id]
+                    is_buy_side = True
                 elif active_sell_orders:
                     order_id = rng.choice(list(active_sell_orders.keys()))
                     remaining_shares, price = active_sell_orders[order_id]
+                    is_buy_side = False
                 else:
                     continue
 
@@ -669,6 +672,20 @@ class ITCHParser:
                         order_id_counter,
                         True,
                         None,
+                    )
+                )
+
+                trade_side = np.uint8(ord('S')) if is_buy_side else np.uint8(ord('B'))
+                self._trades.append(
+                    (
+                        ts,
+                        order_id,
+                        trade_side,
+                        exec_shares,
+                        stock,
+                        price,
+                        order_id_counter,
+                        np.uint8(0),
                     )
                 )
                 order_id_counter += np.uint64(1)
